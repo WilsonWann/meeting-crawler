@@ -1,5 +1,5 @@
 const { dirname, join, extname } = require('path');
-const { promises: fs, existsSync } = require('fs');
+const { promises: fs, existsSync, statSync } = require('fs');
 const dotenv = require('dotenv');
 const puppeteer = require('puppeteer-core');
 const { exec } = require('child_process');
@@ -19,29 +19,22 @@ if (!existsSync(envPath)) {
 dotenv.config({ path: envPath });
 console.log('Loaded environment variables:', process.env);
 
-// 從命令列參數獲取 platform（若有）
+// 從命令列參數獲取 platform
 const platformArg = args.find(arg => arg.startsWith('--platform='));
 const platformFromArgs = platformArg ? platformArg.split('=')[1] : null;
-
-// 決定平台：命令列 > .env > 預設
 const platform = platformFromArgs || process.env.PLATFORM || (process.platform === 'win32' ? 'win' : 'mac');
 
 // 環境變數與預設值
 const desktopPath = process.env.DESKTOP_PATH || join(process.cwd(), 'Meeting');
 const downloadPath = process.env.DOWNLOAD_PATH || join(process.cwd(), 'Downloads');
-const loginWaitTime = parseInt(process.env.LOGIN_WAIT_TIME, 10) || 30000; // 預設 30 秒
-console.log('Desktop Path:', desktopPath);
-console.log('Download Path:', downloadPath);
-console.log('Login Wait Time:', loginWaitTime);
-
+const loginWaitTime = parseInt(process.env.LOGIN_WAIT_TIME, 10) || 30000;
 const logFilePath = process.env.LOG_FILE_PATH || join(process.cwd(), 'crawler_log.txt');
 const chromePath = process.env.CHROME_PATH || (platform === 'win' 
     ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' 
     : '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
 const basePort = parseInt(process.env.REMOTE_DEBUGGING_PORT, 10) || 9222;
 const downloadType = process.env.DOWNLOAD_TYPE || 'WORD';
-console.log("🚀 ~ downloadType:", downloadType)
-const downloadTimeout = parseInt(process.env.DOWNLOAD_TIMEOUT, 10) || 120000;
+const downloadTimeout = parseInt(process.env.DOWNLOAD_TIMEOUT, 10) || 300000; // 增加到 5 分鐘
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -75,11 +68,8 @@ function checkPort(port) {
     return new Promise((resolve) => {
         const server = net.createServer();
         server.once('error', (err) => {
-            if (err.code === 'EADDRINUSE') {
-                resolve(false);
-            } else {
-                resolve(true);
-            }
+            if (err.code === 'EADDRINUSE') resolve(false);
+            else resolve(true);
         });
         server.once('listening', () => {
             server.close();
@@ -105,123 +95,134 @@ async function readUrlFile(filePath) {
     }
 }
 
-async function waitForDownload(downloadPath, timeout = downloadTimeout) {
+async function waitForCookies(page, cookieNames, options = {}) {
+    const {
+        maxAttempts = 5,
+        waitTime = loginWaitTime || 30000,
+        timeout = 120000
+    } = options;
+
     const startTime = Date.now();
+    let attempts = 0;
+
+    while (attempts < maxAttempts && (Date.now() - startTime) < timeout) {
+        try {
+            const cookies = await page.cookies();
+            const hasAllCookies = cookieNames.every(name => 
+                cookies.some(cookie => cookie.name === name)
+            );
+
+            if (hasAllCookies) {
+                await log(`找到所有必要 Cookie: ${cookieNames.join(', ')}`);
+                return true;
+            }
+
+            await log(`未找到所有必要 Cookie: ${cookieNames.join(', ')}，當前 Cookie: ${JSON.stringify(cookies.map(c => c.name))}`);
+            attempts++;
+            await log(`第 ${attempts} 次嘗試，剩餘 ${maxAttempts - attempts} 次，等待 ${waitTime / 1000} 秒...`);
+            await wait(waitTime);
+        } catch (error) {
+            await log(`檢查 Cookie 時發生錯誤: ${error.message}`);
+            attempts++;
+            await wait(waitTime);
+        }
+    }
+
+    await log(`未能在 ${timeout / 1000} 秒內找到所有必要 Cookie: ${cookieNames.join(', ')}`);
+    return false;
+}
+
+async function waitForDownload(downloadPath, timeout = downloadTimeout, startTime = Date.now()) {
+    const endTime = startTime + timeout;
     let downloadedFile = null;
 
-    // 等待檔案出現
-    while (Date.now() - startTime < timeout) {
+    await log(`開始等待下載，超時時間: ${timeout / 1000} 秒`);
+    while (Date.now() < endTime) {
         const files = await fs.readdir(downloadPath);
-        downloadedFile = files.find(file => !file.endsWith('.crdownload')); // 排除 .crdownload 檔案
-        if (downloadedFile) {
-            break;
+        const targetExt = downloadType.toUpperCase() === 'PDF' ? '.pdf' : '.docx';
+
+        const fileStats = await Promise.all(
+            files
+                .filter(file => 
+                    !file.endsWith('.crdownload') && 
+                    !file.startsWith('.') && 
+                    file.endsWith(targetExt)
+                )
+                .map(async file => {
+                    const stats = await fs.stat(join(downloadPath, file));
+                    return { file, mtime: stats.mtimeMs, size: stats.size };
+                })
+        );
+
+        // 只選取下載開始後修改的文件
+        const newFiles = fileStats.filter(f => f.mtime >= startTime);
+        if (newFiles.length > 0) {
+            downloadedFile = newFiles[0].file; // 選第一個新文件
+            const filePath = join(downloadPath, downloadedFile);
+            await log(`發現新下載檔案: ${filePath}`);
+
+            let previousSize = -1;
+            let stableCount = 0;
+            const maxStableCount = 5;
+            const checkInterval = 3000;
+
+            while (Date.now() < endTime) {
+                const stats = await fs.stat(filePath);
+                const currentSize = stats.size;
+                if (currentSize === previousSize && currentSize > 0) {
+                    stableCount++;
+                    if (stableCount >= maxStableCount) {
+                        await wait(2000);
+                        return filePath;
+                    }
+                } else {
+                    stableCount = 0;
+                }
+                previousSize = currentSize;
+                await wait(checkInterval);
+            }
         }
         await wait(1000);
     }
-
-    if (!downloadedFile) {
-        throw new Error('下載超時，未找到下載檔案');
-    }
-
-    const filePath = join(downloadPath, downloadedFile);
-    await log(`發現下載檔案: ${filePath}`);
-
-    // 檢查檔案大小是否穩定
-    let previousSize = -1;
-    let stableCount = 0;
-    const maxStableCount = 3; // 連續 3 次大小不變認為下載完成
-    const checkInterval = 2000; // 每 2 秒檢查一次
-
-    while (Date.now() - startTime < timeout) {
-        const stats = statSync(filePath);
-        const currentSize = stats.size;
-
-        await log(`檢查檔案大小: ${currentSize} bytes`);
-
-        if (currentSize === previousSize) {
-            stableCount++;
-            if (stableCount >= maxStableCount) {
-                await log(`檔案大小穩定，下載完成: ${filePath}`);
-                return filePath;
-            }
-        } else {
-            stableCount = 0;
-        }
-
-        previousSize = currentSize;
-        await wait(checkInterval);
-    }
-
-    throw new Error('下載超時，檔案大小未穩定');
+    throw new Error('下載超時，未找到新下載檔案');
 }
 
 async function startChrome(port) {
     return new Promise((resolve, reject) => {
         const userDataDir = platform === 'win' ? `C:\\Temp\\chrome-remote-${port}` : `/tmp/chrome-remote-${port}`;
-        const isHeadless = args.includes('--headless=false') ? false : true; // 預設 headless: true，可通過 --headless=false 切換
-        let chromeCommand;
-        if (platform === 'mac') {
-            chromeCommand = `"${chromePath}" --remote-debugging-port=${port} --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="${userDataDir}" --no-sandbox --disable-setuid-sandbox --headless=${isHeadless}`;
-        } else if (platform === 'win') {
-            chromeCommand = `"${chromePath}" --remote-debugging-port=${port} --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="${userDataDir}" --no-sandbox --disable-setuid-sandbox --headless=${isHeadless}`;
-        } else {
-            reject(new Error(`不支持的平台: ${platform}`));
-            return;
-        }
-        
+        let chromeCommand = platform === 'mac' 
+            ? `"${chromePath}" --remote-debugging-port=${port} --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="${userDataDir}" --no-sandbox --disable-setuid-sandbox`
+            : `"${chromePath}" --remote-debugging-port=${port} --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="${userDataDir}" --no-sandbox --disable-setuid-sandbox`;
+
         if (!existsSync(chromePath)) {
             log(`錯誤: Chrome 可執行文件不存在於 ${chromePath}`);
             reject(new Error(`Chrome 可執行文件不存在於 ${chromePath}`));
             return;
         }
-        
+
         log(`啟動 Chrome: ${chromeCommand}`);
-        const chromeProcess = exec(
-            chromeCommand,
-            { shell: true },
-            (error, stdout, stderr) => {
-                if (error) {
-                    log(`Chrome 啟動失敗: ${error.message}`);
-                    log(`腳本輸出: ${stdout}`);
-                    log(`錯誤輸出: ${stderr}`);
-                    reject(error);
-                } else {
-                    log(`Chrome 啟動成功，PID: ${chromeProcess.pid}`);
-                    log(`腳本輸出: ${stdout}`);
-                }
+        const chromeProcess = exec(chromeCommand, { shell: true }, (error, stdout, stderr) => {
+            if (error) {
+                log(`Chrome 啟動失敗: ${error.message}`);
+                reject(error);
+            } else {
+                log(`Chrome 啟動成功，PID: ${chromeProcess.pid}`);
             }
-        );
-        chromeProcess.on('error', (err) => {
-            log(`Chrome 進程錯誤: ${err.message}`);
-            reject(err);
         });
+        chromeProcess.on('error', reject);
         chromeProcess.unref();
         setTimeout(() => resolve(chromeProcess), 10000);
     });
 }
 
-async function waitForCookies(page, cookieNames) {
-    let attemptsLeft = 3; // 最多重試 3 次
-    while (attemptsLeft > 0) {
-        const cookies = await page.cookies();
-        const hasAllCookies = cookieNames.every(name => cookies.some(cookie => cookie.name === name));
-        if (hasAllCookies) {
-            await log(`找到所有必要 Cookie: ${cookieNames.join(', ')}`);
-            return true;
-        }
-        await log(`未找到所有必要 Cookie: ${cookieNames.join(', ')}，剩餘 ${attemptsLeft} 次重試，等待 ${loginWaitTime / 1000} 秒...`);
-        await wait(loginWaitTime);
-        attemptsLeft--;
-    }
-    await log(`未能在指定時間內找到所有必要 Cookie: ${cookieNames.join(', ')}`);
-    return false;
-}
-
 async function crawlMeetingUrls() {
     let chromeProcess;
-    let isLoggedIn = false; // 記錄是否已登入
+    let isLoggedIn = false;
+
     try {
         await fs.mkdir(downloadPath, { recursive: true });
+        await fs.access(downloadPath, fs.constants.W_OK);
+        await log(`下載路徑 ${downloadPath} 可寫`);
 
         const port = await findFreePort(basePort);
         await log(`使用遠端除錯端口: ${port}`);
@@ -229,13 +230,13 @@ async function crawlMeetingUrls() {
 
         const wsUrl = `http://127.0.0.1:${port}/json/version`;
         await log(`嘗試連接 WebSocket: ${wsUrl}`);
-        
+
         let attempts = 0;
         const maxAttempts = 10;
-        let response, wsData;
+        let wsData;
         while (attempts < maxAttempts) {
             try {
-                response = await fetch(wsUrl);
+                const response = await fetch(wsUrl);
                 if (!response.ok) throw new Error(`WebSocket 不可用: ${response.statusText}`);
                 wsData = await response.json();
                 break;
@@ -270,21 +271,26 @@ async function crawlMeetingUrls() {
             if (url) {
                 await log(`正在處理: ${file} - ${url}`);
                 const page = await browser.newPage();
+                const client = await page.target().createCDPSession();
 
-                await page._client().send('Page.setDownloadBehavior', {
+                await client.send('Page.setDownloadBehavior', {
                     behavior: 'allow',
                     downloadPath: downloadPath
                 });
+                await log(`下載路徑已設置為: ${downloadPath}`);
 
                 try {
                     await page.setViewport({ width: 1920, height: 1080 });
                     await log(`開始導航到: ${url}`);
-                    await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 }); // 等待網絡空閒
+                    await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
 
-                    // 若尚未登入，檢查 Cookie
                     if (!isLoggedIn) {
                         await log(`檢查必要 Cookie: ${requiredCookies.join(', ')}`);
-                        const cookiesReady = await waitForCookies(page, requiredCookies);
+                        const cookiesReady = await waitForCookies(page, requiredCookies, {
+                            maxAttempts: 5,
+                            waitTime: loginWaitTime,
+                            timeout: 120000
+                        });
                         if (!cookiesReady) {
                             await log('未能在指定時間內找到必要 Cookie，程式中止');
                             await page.close();
@@ -298,20 +304,19 @@ async function crawlMeetingUrls() {
 
                     await log(`導航完成: ${url}`);
 
-                    // 1. 點擊 div.suite-more-menu > button
+                    // 點擊「suite-more-menu」按鈕
                     const menuButton = await page.waitForSelector('div.suite-more-menu > button', { visible: true, timeout: 15000 });
                     if (menuButton) {
                         await menuButton.click();
                         await log('已點擊 div.suite-more-menu > button');
-                        await wait(1000); // 額外等待 1 秒，確保下拉菜單出現
+                        await wait(1000);
                     } else {
-                        await log('未找到可見的 div.suite-more-menu > button');
+                        await log('未找到 div.suite-more-menu > button');
                         await page.screenshot({ path: `debug_${file}_menu.png` });
-                        await log(`已生成調試截圖: debug_${file}_menu.png`);
-                        continue; // 跳過此 URL
+                        continue;
                     }
 
-                    // 2. 移動滑鼠到包含「下載為」的元素中心
+                    // 移動到「下載為」元素
                     const downloadElement = await page.evaluateHandle(() => {
                         const spans = Array.from(document.querySelectorAll('span'));
                         return spans.find(span => span.textContent.trim().includes('下載為'));
@@ -319,25 +324,21 @@ async function crawlMeetingUrls() {
                     if (downloadElement) {
                         const box = await downloadElement.boundingBox();
                         if (box) {
-                            const centerX = box.x + box.width / 2;
-                            const centerY = box.y + box.height / 2;
-                            await page.mouse.move(centerX, centerY);
-                            await log(`已移動到包含「下載為」的元素中心座標 (${centerX}, ${centerY})`);
+                            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+                            await log(`已移動到「下載為」元素中心`);
+                            await wait(2000);
                         } else {
-                            await log('無法獲取包含「下載為」的元素的boundingBox');
+                            await log('無法獲取「下載為」元素的boundingBox');
                             await page.screenshot({ path: `debug_${file}_download.png` });
-                            await log(`已生成調試截圖: debug_${file}_download.png`);
                             continue;
                         }
                     } else {
-                        await log('未找到包含「下載為」的元素');
+                        await log('未找到「下載為」元素');
                         await page.screenshot({ path: `debug_${file}_download.png` });
-                        await log(`已生成調試截圖: debug_${file}_download.png`);
                         continue;
                     }
-                    await wait(2000);
 
-                    // 3. 根據 DOWNLOAD_TYPE 查找「PDF」或「Word」元素，移動滑鼠並點擊
+                    // 選擇下載格式（PDF 或 Word）
                     const targetText = downloadType.toUpperCase() === 'PDF' ? 'PDF' : 'Word';
                     const formatElement = await page.evaluateHandle((text) => {
                         const spans = Array.from(document.querySelectorAll('span'));
@@ -346,66 +347,67 @@ async function crawlMeetingUrls() {
                     if (formatElement) {
                         const box = await formatElement.boundingBox();
                         if (box) {
-                            const centerX = box.x + box.width / 2;
-                            const centerY = box.y + box.height / 2;
-                            await page.mouse.move(centerX, centerY);
-                            await log(`已移動到「${targetText}」元素中心座標 (${centerX}, ${centerY})`);
-                            await page.mouse.click(centerX, centerY);
+                            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
                             await log(`已點擊「${targetText}」元素`);
+                            await wait(2000);
                         } else {
                             await log(`無法獲取「${targetText}」元素的boundingBox`);
                             await page.screenshot({ path: `debug_${file}_format.png` });
-                            await log(`已生成調試截圖: debug_${file}_format.png`);
                             continue;
                         }
                     } else {
-                        await log(`未找到包含「${targetText}」的元素`);
+                        await log(`未找到「${targetText}」元素`);
                         await page.screenshot({ path: `debug_${file}_format.png` });
-                        await log(`已生成調試截圖: debug_${file}_format.png`);
                         continue;
                     }
-                    await wait(2000);
 
-                    // 4. 點擊包含「匯出」的按鈕
-                    await page.waitForSelector('button', { visible: true, timeout: 15000 }); // 確保有按鈕可見
+                    // 點擊「匯出」按鈕並等待下載
                     const exportButtonHandle = await page.evaluateHandle(() => {
                         const buttons = Array.from(document.querySelectorAll('button'));
                         return buttons.find(btn => btn.textContent.trim().includes('匯出'));
                     });
-
-                    // 檢查 exportButtonHandle 是否有效
                     const exportButton = exportButtonHandle.asElement();
+                    const downloadStartTime = Date.now(); // 記錄下載開始時間
                     if (exportButton) {
                         await exportButton.click();
                         await log('已點擊「匯出」按鈕');
+                        await page.screenshot({ path: `debug_${file}_after_export.png` });
 
-                        const downloadedFile = await waitForDownload(downloadPath);
+                        // 處理可能的確認對話框
+                        await page.evaluate(() => {
+                            const confirmButton = document.querySelector('button[class*="confirm"], button[class*="ok"]');
+                            if (confirmButton) confirmButton.click();
+                        });
+                        await log('已檢查並處理可能的確認對話框');
+
+                        const downloadedFile = await waitForDownload(downloadPath, downloadTimeout, downloadStartTime);                     
                         await log(`檔案已下載至: ${downloadedFile}`);
-
+                        
                         const newFileName = `${file.replace('.url', '')}_${Date.now()}${extname(downloadedFile)}`;
                         const newFilePath = join(downloadPath, newFileName);
                         await fs.rename(downloadedFile, newFilePath);
                         await log(`檔案已重新命名為: ${newFilePath}`);
                     } else {
-                        await log('未找到包含「匯出」的按鈕');
+                        await log('未找到「匯出」按鈕');
                         await page.screenshot({ path: `debug_${file}_export.png` });
-                        await log(`已生成調試截圖: debug_${file}_export.png`);
                     }
-
-                    await wait(3000);
                 } catch (error) {
-                    await log(`訪問 ${url} 時發生錯誤: ${error.message}`);
-                    console.error(`訪問 ${url} 時發生錯誤:`, error);
+                    await log(`處理 ${url} 時發生錯誤: ${error.message}`);
                     if (error.name === 'TimeoutError') {
                         await log(`頁面導航或元素等待超時，跳過此 URL: ${url}`);
-                    } else if (error.message.includes('net::ERR_NAME_NOT_RESOLVED')) {
-                        await log(`無法解析域名，跳過此 URL: ${url}`);
-                    } else if (error.message.includes('Target closed')) {
-                        await log(`頁面已關閉，可能是 Chrome 進程提前終止，跳過此 URL: ${url}`);
+                    } else if (error.message.includes('net::ERR')) {
+                        await log(`網路錯誤，跳過此 URL: ${url}`);
                     } else {
                         await log(`其他錯誤，詳情: ${error.stack}`);
                     }
-                } 
+                } finally {
+                    try {
+                        await page.close();
+                        await log(`頁面已關閉: ${url}`);
+                    } catch (closeError) {
+                        await log(`關閉頁面時發生錯誤: ${closeError.message}`);
+                    }
+                }
             }
         }
 
@@ -413,7 +415,7 @@ async function crawlMeetingUrls() {
         await log('所有網頁處理完成！');
     } catch (error) {
         await log(`程式執行發生錯誤: ${error.message}`);
-        console.error('程式執行發生錯誤:', error);
+        console.error('程式執行錯誤:', error);
     } finally {
         if (chromeProcess) {
             chromeProcess.kill();
